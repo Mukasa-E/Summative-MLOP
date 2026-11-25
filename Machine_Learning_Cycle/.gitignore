@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.pth
+.DS_Store
+.ipynb_checkpoints
+data/anomaly detection data/
+data/processed/
+data/train/
+data/test/
+data/uploads/

@@ -1,0 +1,49 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    command: gunicorn --bind 0.0.0.0:5000 --workers 1 --timeout 600 api.app:app
+    restart: unless-stopped
+    deploy:
+      replicas: 1   # change to 2 or 4 for load-test comparison
+
+  ui:
+    build: .
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - API_URL=http://api:5000
+    command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2
+    profiles:
+      - public
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    depends_on:
+      - ui
+
+volumes:
+  caddy_data:
+  caddy_config:
