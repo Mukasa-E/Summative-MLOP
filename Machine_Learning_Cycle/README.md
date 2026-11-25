@@ -139,6 +139,9 @@ password hash in `.env`. Keep `.env` private and do not commit it. Caddy obtains
 and renews HTTPS certificates automatically when the hostname resolves to the
 VM and inbound TCP ports 80 and 443 are allowed.
 
+The Docker image installs CPU-only PyTorch wheels to avoid downloading CUDA
+libraries on CPU-only hosts.
+
 Generate a password hash without putting the plaintext password in shell
 history:
 
