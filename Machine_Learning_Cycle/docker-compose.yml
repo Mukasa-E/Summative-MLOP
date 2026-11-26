@@ -8,8 +8,6 @@ services:
       - ./models:/app/models
     command: gunicorn --bind 0.0.0.0:5000 --workers 1 --timeout 600 api.app:app
     restart: unless-stopped
-    deploy:
-      replicas: 1   # change to 2 or 4 for load-test comparison
 
   ui:
     build: .
@@ -34,8 +32,6 @@ services:
       - "443:443/udp"
     environment:
       DOMAIN: ${DOMAIN:-}
-      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
-      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

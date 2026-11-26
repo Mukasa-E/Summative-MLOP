@@ -4,6 +4,8 @@ __pycache__/
 venv/
 .env
 *.pth
+!models/autoencoder_mvtec.pth
+!models/autoencoder_mvtec_*.pth
 .DS_Store
 .ipynb_checkpoints
 data/anomaly detection data/

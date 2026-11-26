@@ -13,12 +13,32 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
+from .preprocessing import MVTEC_CATEGORIES
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "autoencoder_mvtec.pth")
 THRESHOLD_PATH = os.path.join(MODEL_DIR, "threshold.npy")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_CATEGORY = "bottle"
+DEFAULT_THRESHOLD_PERCENTILE = 70
+
+
+def _category_artifact_path(category, artifact):
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
+    if category == DEFAULT_CATEGORY:
+        return MODEL_PATH if artifact == "model" else THRESHOLD_PATH
+    suffix = "pth" if artifact == "model" else "npy"
+    stem = "autoencoder_mvtec" if artifact == "model" else "threshold"
+    return os.path.join(MODEL_DIR, f"{stem}_{category}.{suffix}")
+
+
+def category_model_ready(category=DEFAULT_CATEGORY):
+    """Return whether both category-specific inference artifacts exist."""
+    model_path = _category_artifact_path(category, "model")
+    threshold_path = _category_artifact_path(category, "threshold")
+    return os.path.isfile(model_path) and os.path.isfile(threshold_path)
 
 
 class ConvAutoencoder(nn.Module):
@@ -58,6 +78,7 @@ def train_model(
     verbose=True,
     validation_data=None,
     patience=3,
+    category=DEFAULT_CATEGORY,
 ):
     """
     Train the autoencoder on normal images only, optionally using validation
@@ -70,6 +91,7 @@ def train_model(
         raise ValueError("epochs must be at least 1")
     if validation_data is not None and patience < 1:
         raise ValueError("patience must be at least 1")
+    model_path = _category_artifact_path(category, "model")
     os.makedirs(MODEL_DIR, exist_ok=True)
     torch.manual_seed(42)
     training_sample_count = len(X_train)
@@ -147,15 +169,16 @@ def train_model(
     if best_state is not None:
         model.load_state_dict(best_state)
         model.eval()
-    torch.save(model.state_dict(), MODEL_PATH)
-    print(f"[INFO] Model saved to {MODEL_PATH}")
+    torch.save(model.state_dict(), model_path)
+    print(f"[INFO] Model saved to {model_path}")
     return model, history
 
 
-def load_model():
-    """Load a trained autoencoder from disk."""
+def load_model(category=DEFAULT_CATEGORY):
+    """Load a trained autoencoder for one supported product category."""
+    model_path = _category_artifact_path(category, "model")
     model = ConvAutoencoder().to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
     return model
 
@@ -177,25 +200,37 @@ def anomaly_score(model, X):
     return errors, recon.cpu().numpy()
 
 
-def select_threshold(scores_normal, percentile=90):
+def select_threshold(scores_normal, percentile=DEFAULT_THRESHOLD_PERCENTILE):
     """
     Choose anomaly threshold from normal validation reconstruction errors.
-    Default: 90th percentile of held-out normal errors.
+    Default: 70th percentile of held-out normal errors, a recall-oriented
+    operating point that may increase false positives.
     """
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be between 0 and 100")
+    scores_normal = np.asarray(scores_normal)
+    if scores_normal.size == 0:
+        raise ValueError("scores_normal must contain at least one score")
+    if not np.isfinite(scores_normal).all():
+        raise ValueError("scores_normal must contain only finite values")
     threshold = np.percentile(scores_normal, percentile)
     print(f"[INFO] Threshold (p{percentile}) = {threshold:.6f}")
     return threshold
 
 
-def save_threshold(value, path=THRESHOLD_PATH):
+def save_threshold(value, path=None, category=DEFAULT_CATEGORY):
     """Persist the anomaly threshold to disk."""
+    if path is None:
+        path = _category_artifact_path(category, "threshold")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     np.save(path, np.asarray(value, dtype=np.float64))
     print(f"[INFO] Threshold saved to {path}")
 
 
-def load_threshold(path=THRESHOLD_PATH):
+def load_threshold(path=None, category=DEFAULT_CATEGORY):
     """Load the persisted anomaly threshold."""
+    if path is None:
+        path = _category_artifact_path(category, "threshold")
     values = np.asarray(np.load(path)).reshape(-1)
     if values.size != 1:
         raise ValueError(f"Expected one threshold value in {path}, found {values.size}")

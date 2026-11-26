@@ -64,7 +64,7 @@ Register and download the dataset from https://www.mvtec.com/company/research/da
 ```bash
 python -c "
 from src.preprocessing import acquire_and_prepare
-X_train, X_test, y_test, paths = acquire_and_prepare('bottle', limit=300)
+X_train, X_test, y_test, paths = acquire_and_prepare('bottle', limit=None)
 "
 ```
 
@@ -73,12 +73,14 @@ X_train, X_test, y_test, paths = acquire_and_prepare('bottle', limit=300)
 Or run the complete training, threshold selection, and evaluation pipeline against the real MVTec data:
 
 ```bash
-python retrain.py --category bottle --limit 300 --epochs 10 --percentile 90
+python retrain.py --category bottle --epochs 10 --percentile 70
 ```
 
-Run this at least once on each machine before starting the API if the local model checkpoint is missing; model weights and dataset artifacts are intentionally excluded from Git.
+By default, retraining uses every available image in the selected category's train and test splits. Training still fits on normal `train/good` images only; anomalous images and the mixed test split are kept out of fitting. To train all 15 categories one after another, run `python retrain.py --category all --epochs 10 --percentile 70`. This can take considerably longer than training one category. Run it at least once for each category before starting inference for that category. The trained bottle checkpoint and threshold are included in `models/` so the grader can run bottle inference without first training; other category checkpoints are created by retraining them. Raw dataset and processed arrays remain excluded from Git.
 
-Training uses defect-free `train/good` images and any additional normal images saved through **Upload & Retrain** under `data/uploads/<category>/normal/`. Images submitted on the **Predict** page are inference-only and are not added to training. A normal-only validation split drives early stopping and threshold selection; the category's test images are held back for evaluation. The default 90th-percentile threshold favors defect recall over the more conservative 95th-percentile setting, so some false positives are expected. The model is category-specific and is tuned to the MVTec image distribution; normal images with different backgrounds, lighting, or viewpoints may still score as anomalous. Each image score is the mean error over the highest-error 0.5% of pixels, which is more sensitive to small localized defects than whole-image average error.
+Each product category is trained and validated separately using its own normal training images, model checkpoint, and threshold. Do not mix unrelated product categories into one model: their normal appearances and anomaly-score distributions differ. Training uses defect-free `train/good` images and any additional verified normal images saved through **Upload & Retrain** under `data/uploads/<category>/normal/`. Do not upload defective images to this directory: all uploaded images are treated as normal training examples. Images submitted on the **Predict** page are inference-only and are not added to training. A normal-only validation split drives early stopping and threshold selection; the category's mixed test images are held back for evaluation. The default 70th-percentile threshold is a recall-oriented operating point and will cause more false alarms than the previous 90th-percentile setting. Confirm the trade-off on validation data and report final test performance without tuning against test labels. The model is tuned to the MVTec image distribution; normal images with different backgrounds, lighting, or viewpoints may still score as anomalous. Each image score is the mean error over the highest-error 0.5% of pixels, which is more sensitive to small localized defects than whole-image average error.
+
+The UI supports all 15 MVTec categories, but each category must be trained before its model can be used for prediction. The upload page requires confirmation that all new training images are normal and limits each image to 10 MB.
 
 ```bash
 python -c "
@@ -91,14 +93,19 @@ X_test  = np.load('data/processed/bottle_X_test.npy')
 y_test  = np.load('data/processed/bottle_y_test.npy')
 X_fit, X_validation = train_test_split(X_train, test_size=0.2, random_state=42)
 
-model, history = train_model(X_fit, epochs=10, validation_data=X_validation)
+model, history = train_model(
+    X_fit,
+    epochs=10,
+    validation_data=X_validation,
+    category="bottle",
+)
 
 # threshold from held-out normal reconstruction errors
 scores_normal, _ = anomaly_score(model, X_validation)
-thr = select_threshold(scores_normal, percentile=90)
+thr = select_threshold(scores_normal, percentile=70)
 
 from src.model import save_threshold
-save_threshold(thr)
+save_threshold(thr, category="bottle")
 
 # evaluate
 labels, scores = predict(model, X_test, thr)
@@ -130,24 +137,16 @@ docker compose up --build
 # UI:   http://localhost:8501
 ```
 
-### 8. Publish the UI securely on an Azure VM
+### 8. Publish the UI on an Azure VM
 
 The default Compose setup binds the API and UI to the VM's loopback interface.
 To publish the UI, configure a DNS hostname for the VM's public IP, copy
-`.env.example` to `.env`, and set `DOMAIN`, `BASIC_AUTH_USER`, and a Caddy
-password hash in `.env`. Keep `.env` private and do not commit it. Caddy obtains
-and renews HTTPS certificates automatically when the hostname resolves to the
-VM and inbound TCP ports 80 and 443 are allowed.
+`.env.example` to `.env`, and set `DOMAIN`. Keep `.env` private and do not
+commit it. Caddy obtains and renews HTTPS certificates automatically when the
+hostname resolves to the VM and inbound TCP ports 80 and 443 are allowed.
 
 The Docker image installs CPU-only PyTorch wheels to avoid downloading CUDA
 libraries on CPU-only hosts.
-
-Generate a password hash without putting the plaintext password in shell
-history:
-
-```bash
-docker run --rm -it caddy:2 caddy hash-password
-```
 
 In Azure, allow inbound TCP ports 80 and 443 to the VM, keeping SSH restricted
 to your IP. Start the public profile with:
@@ -157,9 +156,10 @@ docker compose --profile public up --build -d
 ```
 
 Only Caddy publishes public ports; the API stays internal to the Compose
-network. The UI is protected by HTTP Basic Authentication over HTTPS. This is
-appropriate for a small demo; use an identity provider for individual accounts
-or broader production use.
+network. The UI is publicly accessible over HTTPS without a sign-in prompt.
+This is useful for facilitator grading, but anyone with the link can use the
+UI, including its upload and retraining controls. Do not use this configuration
+for private data or an unrestricted production service.
 
 ---
 
@@ -169,7 +169,8 @@ or broader production use.
 |---|---|---|
 | GET | `/health` | Health check (model uptime) |
 | POST | `/predict` | Upload one image → anomaly prediction |
-| POST | `/retrain` | Trigger model retraining |
+| POST | `/retrain` | Start background retraining of the bottle model |
+| GET | `/retrain/status/<job_id>` | Check background retraining status and results |
 | GET | `/metrics` | Basic performance metrics |
 
 Example `/predict` (curl):
@@ -195,19 +196,22 @@ Response (image values are PNG data URLs; reconstruction and heatmap are resized
 
 The reconstruction shows the autoencoder output, the error heatmap highlights high per-pixel reconstruction error, and the overlay places that heatmap over the resized input.
 
+`/predict` accepts an optional `category` form field (defaults to `bottle`) and image requests up to 10 MB. `/retrain` accepts a supported MVTec category and trains a category-specific model. Prediction returns HTTP 503 when the selected category does not yet have a trained checkpoint.
+`/retrain` returns HTTP 202 and a job ID; poll `/retrain/status/<job_id>` until the job reports `completed` or `failed`.
+
 ---
 
 ## Load Testing with Locust
 
-Simulate a flood of requests to measure latency and response time under different Docker container counts:
+The Locust script simulates prediction and health requests:
 
 ```bash
 locust -f locustfile.py --host=http://localhost:5000
 ```
 
-Then open http://localhost:8089, set users/spawn rate, and record results.
+Then open http://localhost:8089, set users/spawn rate, and save the Locust report. The API port is currently published on a fixed host port, so scaling the Compose API service with `--scale api=2` or `--scale api=4` is not a validated benchmark configuration. Do not report multi-container results until a load balancer / orchestrator configuration routes traffic across the replicas and each run is recorded under the same request profile.
 
-Test with 1, 2, and 4 containers (`docker-compose up --scale api=1`, etc.) and compare average response time.
+Report response throughput, median and 95th-percentile latency, and failure rate. The saved project currently contains the test script but no benchmark result files.
 
 ---
 
@@ -221,5 +225,7 @@ Test with 1, 2, and 4 containers (`docker-compose up --scale api=1`, etc.) and c
 4. **Evaluation** — accuracy, loss, F1-score, precision, recall, ROC-AUC
 5. **Visualizations** — reconstructions, error heatmaps, feature insights (≥3 features)
 6. **Prediction demo** — single-image inference
+
+The notebook is executed with saved loss curves, sample images, reconstruction/error visualizations, and evaluation metrics.
 
 ---

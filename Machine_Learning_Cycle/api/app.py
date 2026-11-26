@@ -10,6 +10,8 @@ Endpoints:
 import os
 import io
 import base64
+import threading
+import uuid
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -18,29 +20,46 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.model import THRESHOLD_PATH, anomaly_score, load_model, predict, select_threshold, train_model
+from src.model import (
+    DEFAULT_CATEGORY,
+    DEFAULT_THRESHOLD_PERCENTILE,
+    anomaly_score,
+    category_model_ready,
+    load_model,
+    load_threshold as load_saved_threshold,
+    predict,
+    select_threshold,
+    train_model,
+)
 from src.prediction import load_threshold, predict_single, save_threshold
+from src.preprocessing import MVTEC_CATEGORIES
 
 app = Flask(__name__)
 CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 # Lazy-load model
-_model = None
-_threshold = None
+_models = {}
+_thresholds = {}
+_retraining_lock = threading.Lock()
+_retrain_job_lock = threading.Lock()
+_retrain_job = None
 
 
-def get_model():
-    global _model
-    if _model is None:
-        _model = load_model()
-    return _model
+def get_model(category=DEFAULT_CATEGORY):
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
+    if category not in _models:
+        _models[category] = load_model(category=category)
+    return _models[category]
 
 
-def get_threshold():
-    global _threshold
-    if _threshold is None:
-        _threshold = load_threshold()
-    return _threshold
+def get_threshold(category=DEFAULT_CATEGORY):
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
+    if category not in _thresholds:
+        _thresholds[category] = load_threshold(category=category)
+    return _thresholds[category]
 
 
 def _image_data_url(image):
@@ -54,9 +73,13 @@ def _image_data_url(image):
 def health():
     """Model uptime check."""
     try:
-        get_model()
-        get_threshold()
-        return jsonify({"status": "healthy", "model_loaded": True}), 200
+        get_model(DEFAULT_CATEGORY)
+        get_threshold(DEFAULT_CATEGORY)
+        return jsonify({
+            "status": "healthy",
+            "model_loaded": True,
+            "default_category": DEFAULT_CATEGORY,
+        }), 200
     except Exception as exc:
         return jsonify({"status": "unhealthy", "error": str(exc)}), 500
 
@@ -70,15 +93,22 @@ def predict_endpoint():
     file = request.files["file"]
     if file.filename == "":
         return jsonify({"error": "Empty filename."}), 400
+    category = request.form.get("category", DEFAULT_CATEGORY)
+    if category not in MVTEC_CATEGORIES:
+        return jsonify({
+            "error": f"Unsupported MVTec category '{category}'. "
+            f"Choose from: {', '.join(MVTEC_CATEGORIES)}"
+        }), 400
 
     try:
         with Image.open(io.BytesIO(file.read())) as uploaded_image:
             img = uploaded_image.convert("RGB")
         result = predict_single(
             img,
-            model=get_model(),
-            threshold=get_threshold(),
+            model=get_model(category),
+            threshold=get_threshold(category),
             include_images=True,
+            category=category,
         )
         reconstruction = result.pop("reconstruction")
         error_map = result.pop("error_map")
@@ -110,75 +140,155 @@ def predict_endpoint():
 
     except UnidentifiedImageError:
         return jsonify({"error": "Uploaded file is not a valid supported image."}), 400
+    except FileNotFoundError:
+        return jsonify({
+            "error": f"No trained model is available for '{category}'. "
+            "Retrain this category first."
+        }), 503
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+def _perform_retraining(category):
+    from src.preprocessing import acquire_and_prepare
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import (
+        accuracy_score,
+        f1_score,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
+
+    X_train, X_test, y_test, _ = acquire_and_prepare(category, limit=None)
+    X_fit, X_validation = train_test_split(
+        X_train,
+        test_size=0.2,
+        random_state=42,
+    )
+    model, _ = train_model(
+        X_fit,
+        epochs=10,
+        validation_data=X_validation,
+        category=category,
+    )
+
+    scores_normal, _ = anomaly_score(model, X_validation)
+    threshold = select_threshold(
+        scores_normal,
+        percentile=DEFAULT_THRESHOLD_PERCENTILE,
+    )
+    labels, scores = predict(model, X_test, threshold)
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, labels)),
+        "precision": float(precision_score(y_test, labels, zero_division=0)),
+        "recall": float(recall_score(y_test, labels, zero_division=0)),
+        "f1": float(f1_score(y_test, labels, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_test, scores)),
+    }
+
+    save_threshold(threshold, category=category)
+    _models[category] = model
+    _thresholds[category] = threshold
+    return {
+        "status": "completed",
+        "category": category,
+        "train_samples": int(len(X_train)),
+        "fit_samples": int(len(X_fit)),
+        "validation_samples": int(len(X_validation)),
+        "test_samples": int(len(X_test)),
+        "metrics": metrics,
+    }
+
+
+def _run_retraining_job(job_id, category):
+    global _retrain_job
+    try:
+        result = _perform_retraining(category)
+        with _retrain_job_lock:
+            if _retrain_job and _retrain_job["job_id"] == job_id:
+                _retrain_job.update(result)
+    except Exception as exc:
+        with _retrain_job_lock:
+            if _retrain_job and _retrain_job["job_id"] == job_id:
+                _retrain_job.update({"status": "failed", "error": str(exc)})
+    finally:
+        _retraining_lock.release()
 
 
 @app.route("/retrain", methods=["POST"])
 def retrain_endpoint():
-    """
-    Trigger retraining. Expects optional form field 'category' (default 'bottle').
-    In production this would enqueue a background job (e.g., Celery/Prefect).
-    """
-    category = request.form.get("category", "bottle")
-    try:
-        from src.preprocessing import acquire_and_prepare
-
-        # Re-acquire + preprocess
-        X_train, X_test, y_test, _ = acquire_and_prepare(category, limit=300)
-
-        # Train
-        from sklearn.model_selection import train_test_split
-        X_fit, X_validation = train_test_split(
-            X_train,
-            test_size=0.2,
-            random_state=42,
-        )
-        model, _ = train_model(
-            X_fit,
-            epochs=10,
-            validation_data=X_validation,
-        )
-
-        # New threshold
-        scores_normal, _ = anomaly_score(model, X_validation)
-        thr = select_threshold(scores_normal, percentile=90)
-        save_threshold(thr)
-
-        # Evaluate on test
-        labels, scores = predict(model, X_test, thr)
-        from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-        metrics = {
-            "accuracy": float(accuracy_score(y_test, labels)),
-            "precision": float(precision_score(y_test, labels, zero_division=0)),
-            "recall": float(recall_score(y_test, labels, zero_division=0)),
-            "f1": float(f1_score(y_test, labels, zero_division=0)),
-            "roc_auc": float(roc_auc_score(y_test, scores)),
-        }
-        global _model, _threshold
-        _model = model
-        _threshold = thr
-
+    """Start a retraining job for the supported model category."""
+    global _retrain_job
+    category = request.form.get("category", DEFAULT_CATEGORY)
+    if category not in MVTEC_CATEGORIES:
         return jsonify({
-            "status": "retrained",
-            "category": category,
-            "train_samples": int(len(X_train)),
-            "fit_samples": int(len(X_fit)),
-            "validation_samples": int(len(X_validation)),
-            "test_samples": int(len(X_test)),
-            "metrics": metrics,
-        }), 200
+            "error": f"Unsupported MVTec category '{category}'. Choose from: "
+            f"{', '.join(MVTEC_CATEGORIES)}"
+        }), 400
 
+    if not _retraining_lock.acquire(blocking=False):
+        with _retrain_job_lock:
+            return jsonify({
+                "error": "A retraining job is already running.",
+                "job_id": _retrain_job["job_id"] if _retrain_job else None,
+            }), 409
+
+    job_id = uuid.uuid4().hex
+    with _retrain_job_lock:
+        _retrain_job = {
+            "job_id": job_id,
+            "status": "running",
+            "category": category,
+        }
+
+    worker = threading.Thread(
+        target=_run_retraining_job,
+        args=(job_id, category),
+        daemon=True,
+    )
+    try:
+        worker.start()
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        with _retrain_job_lock:
+            _retrain_job.update({"status": "failed", "error": str(exc)})
+        _retraining_lock.release()
+        return jsonify({"error": f"Could not start retraining: {exc}"}), 500
+
+    return jsonify({
+        "status": "running",
+        "job_id": job_id,
+        "category": category,
+    }), 202
+
+
+@app.route("/retrain/status/<job_id>", methods=["GET"])
+def retrain_status_endpoint(job_id):
+    with _retrain_job_lock:
+        if not _retrain_job or _retrain_job["job_id"] != job_id:
+            return jsonify({"error": "Retraining job not found."}), 404
+        return jsonify(dict(_retrain_job)), 200
+
+
+@app.errorhandler(413)
+def request_entity_too_large(_error):
+    return jsonify({"error": "Uploaded image exceeds the 10 MB request limit."}), 413
 
 
 @app.route("/metrics", methods=["GET"])
 def metrics_endpoint():
     """Return last known evaluation metrics (placeholder — recompute if needed)."""
-    threshold = load_threshold() if os.path.exists(THRESHOLD_PATH) else None
+    category = request.args.get("category", DEFAULT_CATEGORY)
+    if category not in MVTEC_CATEGORIES:
+        return jsonify({"error": f"Unsupported MVTec category: {category}"}), 400
+    try:
+        threshold = load_saved_threshold(category=category)
+    except FileNotFoundError:
+        threshold = None
     return jsonify({
         "model": "conv_autoencoder",
+        "category": category,
+        "model_ready": category_model_ready(category),
         "threshold": threshold,
         "device": "cuda" if __import__("torch").cuda.is_available() else "cpu",
     }), 200

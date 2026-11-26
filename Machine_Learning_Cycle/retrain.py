@@ -7,16 +7,19 @@ and saves model + threshold to models/.
 import os
 import sys
 import argparse
+import json
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.preprocessing import acquire_and_prepare
-from src.model import train_model, anomaly_score, select_threshold
+from src.preprocessing import MVTEC_CATEGORIES, acquire_and_prepare
+from src.model import DEFAULT_THRESHOLD_PERCENTILE, train_model, anomaly_score, select_threshold
 from src.prediction import save_threshold
 
 
-def retrain(category="bottle", limit=300, epochs=10, percentile=90):
+def retrain(category="bottle", limit=None, epochs=10, percentile=DEFAULT_THRESHOLD_PERCENTILE):
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
     print(f"[RETRAIN] Category: {category} | limit: {limit} | epochs: {epochs}")
 
     # 1. Acquire + preprocess the selected MVTec category
@@ -33,12 +36,13 @@ def retrain(category="bottle", limit=300, epochs=10, percentile=90):
         X_fit,
         epochs=epochs,
         validation_data=X_validation,
+        category=category,
     )
 
     # 3. Select threshold from held-out normal reconstruction errors
     scores_normal, _ = anomaly_score(model, X_validation)
     thr = select_threshold(scores_normal, percentile=percentile)
-    save_threshold(thr)
+    save_threshold(thr, category=category)
 
     # 4. Evaluate on test set
     from src.model import predict
@@ -57,9 +61,29 @@ def retrain(category="bottle", limit=300, epochs=10, percentile=90):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--category", default="bottle")
-    parser.add_argument("--limit", type=int, default=300)
+    parser.add_argument(
+        "--category",
+        default="bottle",
+        help="MVTec category to train, or 'all' to train categories sequentially",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum images per split; by default use the full category dataset",
+    )
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--percentile", type=int, default=90)
+    parser.add_argument("--percentile", type=int, default=DEFAULT_THRESHOLD_PERCENTILE)
     args = parser.parse_args()
-    retrain(args.category, args.limit, args.epochs, args.percentile)
+    if args.category == "all":
+        results = {}
+        for category in MVTEC_CATEGORIES:
+            results[category] = retrain(
+                category,
+                args.limit,
+                args.epochs,
+                args.percentile,
+            )
+        print(json.dumps(results, indent=2))
+    else:
+        retrain(args.category, args.limit, args.epochs, args.percentile)

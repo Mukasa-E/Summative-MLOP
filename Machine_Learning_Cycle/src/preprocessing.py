@@ -24,6 +24,23 @@ TRAIN_DIR = os.path.join(PROJECT_ROOT, "data", "train")
 TEST_DIR = os.path.join(PROJECT_ROOT, "data", "test")
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "data", "uploads")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif")
+MVTEC_CATEGORIES = (
+    "bottle",
+    "cable",
+    "capsule",
+    "carpet",
+    "grid",
+    "hazelnut",
+    "leather",
+    "metal_nut",
+    "pill",
+    "screw",
+    "tile",
+    "toothbrush",
+    "transistor",
+    "wood",
+    "zipper",
+)
 
 
 def ensure_dirs():
@@ -51,6 +68,14 @@ def load_mvtec_images(category, split="train", limit=None):
     labels : list of int   (0 = normal/good, 1 = anomalous/defective)
     paths  : list of str
     """
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(
+            f"Unsupported MVTec category '{category}'. "
+            f"Choose one of: {', '.join(MVTEC_CATEGORIES)}"
+        )
+    if split not in {"train", "test"}:
+        raise ValueError("split must be 'train' or 'test'")
+
     base = os.path.join(RAW_DATA_ROOT, category, split)
     images, labels, paths = [], [], []
 

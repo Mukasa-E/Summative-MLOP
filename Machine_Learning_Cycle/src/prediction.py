@@ -13,19 +13,30 @@ from .model import (
     load_threshold as _load_threshold,
     save_threshold as _save_threshold,
 )
+from .preprocessing import MVTEC_CATEGORIES
 
 
-def load_threshold():
+def load_threshold(category="bottle"):
     """Load the saved anomaly threshold."""
-    return _load_threshold()
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
+    return _load_threshold(category=category)
 
 
-def save_threshold(value):
+def save_threshold(value, category="bottle"):
     """Save the anomaly threshold."""
-    _save_threshold(value)
+    if category not in MVTEC_CATEGORIES:
+        raise ValueError(f"Unsupported MVTec category: {category}")
+    _save_threshold(value, category=category)
 
 
-def predict_single(image_path_or_pil, model=None, threshold=None, include_images=False):
+def predict_single(
+    image_path_or_pil,
+    model=None,
+    threshold=None,
+    include_images=False,
+    category="bottle",
+):
     """
     Predict whether a single image is anomalous.
 
@@ -49,9 +60,9 @@ def predict_single(image_path_or_pil, model=None, threshold=None, include_images
         reconstruction and error_map : arrays, only when include_images=True
     """
     if model is None:
-        model = load_model()
+        model = load_model(category=category)
     if threshold is None:
-        threshold = load_threshold()
+        threshold = load_threshold(category=category)
 
     if isinstance(image_path_or_pil, (str, bytes)) or hasattr(image_path_or_pil, "__fspath__"):
         with Image.open(image_path_or_pil) as image:
@@ -84,9 +95,9 @@ def predict_single(image_path_or_pil, model=None, threshold=None, include_images
     return result
 
 
-def predict_batch(image_paths):
+def predict_batch(image_paths, category="bottle"):
     """Predict for a list of image paths. Returns list of result dicts."""
-    return [predict_single(p) for p in image_paths]
+    return [predict_single(p, category=category) for p in image_paths]
 
 
 if __name__ == "__main__":
