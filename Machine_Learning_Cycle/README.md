@@ -4,7 +4,11 @@ End-to-end MLOps project **manufacturing defect detection** on the [MVTec Anomal
 
 **Use case:** Detect microscopic scratches, dents, or missing components on industrial parts (screws, bottles, circuit boards, etc.) using anomaly detection — the model learns what "normal" looks like and flags anything that deviates.
 
+Link to the report:https://docs.google.com/document/d/1nrRAbg7c3En7ji9u58jdAX9NjbTyAbPkBZ9zNiNmOpM/edit?tab=t.0
 
+Link to the deployed streamlit ui:https://rodamanomaly.centralindia.cloudapp.azure.com/
+
+Video demo:https://youtu.be/HpXgcdxYPDE?si=aGmFZhQ4od0wAIGK
 
 ## Project Structure
 
@@ -19,7 +23,7 @@ Machine_Learning_Cycle/
 │
 ├── notebook/
 │   └──summative_mlop.ipynb         # EDA, training, evaluation (≥4 metrics)
-│
+│── Report                          #Find report pdf here
 ├── src/
 │   ├── preprocessing.py           # Data acquisition & image preprocessing
 │   ├── model.py                   # ConvAutoencoder anomaly model
@@ -148,18 +152,12 @@ hostname resolves to the VM and inbound TCP ports 80 and 443 are allowed.
 The Docker image installs CPU-only PyTorch wheels to avoid downloading CUDA
 libraries on CPU-only hosts.
 
-In Azure, allow inbound TCP ports 80 and 443 to the VM, keeping SSH restricted
-to your IP. Start the public profile with:
+
+ Start the public profile with:
 
 ```bash
 docker compose --profile public up --build -d
 ```
-
-Only Caddy publishes public ports; the API stays internal to the Compose
-network. The UI is publicly accessible over HTTPS without a sign-in prompt.
-This is useful for facilitator grading, but anyone with the link can use the
-UI, including its upload and retraining controls. Do not use this configuration
-for private data or an unrestricted production service.
 
 ---
 
@@ -194,11 +192,6 @@ Response (image values are PNG data URLs; reconstruction and heatmap are resized
 }
 ```
 
-The reconstruction shows the autoencoder output, the error heatmap highlights high per-pixel reconstruction error, and the overlay places that heatmap over the resized input.
-
-`/predict` accepts an optional `category` form field (defaults to `bottle`) and image requests up to 10 MB. `/retrain` accepts a supported MVTec category and trains a category-specific model. Prediction returns HTTP 503 when the selected category does not yet have a trained checkpoint.
-`/retrain` returns HTTP 202 and a job ID; poll `/retrain/status/<job_id>` until the job reports `completed` or `failed`.
-
 ---
 
 ## Load Testing with Locust
@@ -208,10 +201,6 @@ The Locust script simulates prediction and health requests:
 ```bash
 locust -f locustfile.py --host=http://localhost:5000
 ```
-
-Then open http://localhost:8089, set users/spawn rate, and save the Locust report. The API port is currently published on a fixed host port, so scaling the Compose API service with `--scale api=2` or `--scale api=4` is not a validated benchmark configuration. Do not report multi-container results until a load balancer / orchestrator configuration routes traffic across the replicas and each run is recorded under the same request profile.
-
-Report response throughput, median and 95th-percentile latency, and failure rate. The saved project currently contains the test script but no benchmark result files.
 
 ---
 
